@@ -8,6 +8,8 @@ using System.Collections;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Data;
+using System.Data.Common;
+using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
 using System.Reflection;
@@ -2985,10 +2987,61 @@ namespace Dapper
         }
 
         private static readonly MethodInfo
-                    enumParse = typeof(Enum).GetMethod(nameof(Enum.Parse), new Type[] { typeof(Type), typeof(string), typeof(bool) }),
-                    getItem = typeof(IDataRecord).GetProperties(BindingFlags.Instance | BindingFlags.Public)
-                        .Where(p => p.GetIndexParameters().Length > 0 && p.GetIndexParameters()[0].ParameterType == typeof(int))
-                        .Select(p => p.GetGetMethod()).First();
+            enumParse = typeof(Enum).GetMethod(nameof(Enum.Parse), new Type[] { typeof(Type), typeof(string), typeof(bool) }),
+            isDBNullMethod = typeof(IDataRecord).GetMethod("IsDBNull"),
+            getItem = typeof(IDataRecord).GetMethod("GetValue");
+          
+        private static readonly MethodInfo getBooleanMethod = typeof(IDataRecord).GetMethod("GetBoolean");
+        private static readonly MethodInfo getByteMethod = typeof(IDataRecord).GetMethod("GetByte");
+        private static readonly MethodInfo getCharMethod = typeof(IDataRecord).GetMethod("GetChar");
+        private static readonly MethodInfo getInt16Method = typeof(IDataRecord).GetMethod("GetInt16");
+        private static readonly MethodInfo getInt32Method = typeof(IDataRecord).GetMethod("GetInt32");
+        private static readonly MethodInfo getInt64Method = typeof(IDataRecord).GetMethod("GetInt64");
+        private static readonly MethodInfo getFloatMethod = typeof(IDataRecord).GetMethod("GetFloat");
+        private static readonly MethodInfo getDoubleMethod = typeof(IDataRecord).GetMethod("GetDouble");
+        private static readonly MethodInfo getDecimalMethod = typeof(IDataRecord).GetMethod("GetDecimal");
+        private static readonly MethodInfo getDateTimeMethod = typeof(IDataRecord).GetMethod("GetDateTime");
+        private static readonly MethodInfo getGuidMethod = typeof(IDataRecord).GetMethod("GetGuid");
+        private static readonly MethodInfo getStringMethod = typeof(IDataRecord).GetMethod("GetString");
+
+        static MethodInfo GetAccessorMethod(Type type, out bool isValueType)
+        {
+            isValueType = true;
+            var code = Type.GetTypeCode(type);
+            switch (code)
+            {
+                case TypeCode.String:
+                    isValueType = false;
+                    return getStringMethod;
+                case TypeCode.Boolean:
+                    return getBooleanMethod;
+                case TypeCode.Byte:
+                    return getByteMethod;
+                case TypeCode.Char:
+                    return getCharMethod;
+                case TypeCode.Int16:
+                    return getInt16Method;
+                case TypeCode.Int32:
+                    return getInt32Method;
+                case TypeCode.Int64:
+                    return getInt64Method;
+                case TypeCode.DateTime:
+                    return getDateTimeMethod;
+                case TypeCode.Single:
+                    return getFloatMethod;
+                case TypeCode.Double:
+                    return getDoubleMethod;
+                case TypeCode.Decimal:
+                    return getDecimalMethod;
+                default:
+                    if(type == typeof(Guid))
+                    {
+                        return getGuidMethod;
+                    }
+                    isValueType = false;
+                    return getItem;
+            }
+        }
 
         /// <summary>
         /// Gets type-map for the given type
@@ -3058,12 +3111,6 @@ namespace Dapper
         /// <summary>
         /// Internal use only
         /// </summary>
-        /// <param name="type"></param>
-        /// <param name="reader"></param>
-        /// <param name="startBound"></param>
-        /// <param name="length"></param>
-        /// <param name="returnNullIfFirstMissing"></param>
-        /// <returns></returns>
         public static Func<IDataReader, object> GetTypeDeserializer(
             Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnNullIfFirstMissing = false
         )
@@ -3180,6 +3227,7 @@ namespace Dapper
 
                 if (i < length)
                 {
+                    var canBeNull = GetColumnAllowsDBNull(reader, i);
                     LoadReaderValueOrBranchToDBNullLabel(
                         il,
                         startBound + i,
@@ -3187,16 +3235,21 @@ namespace Dapper
                         valueCopyLocal: null,
                         reader.GetFieldType(startBound + i),
                         targetType,
-                        out var isDbNullLabel);
+                        out var isDbNullLabel,
+                        canBeNull);
 
                     var finishLabel = il.DefineLabel();
                     il.Emit(OpCodes.Br_S, finishLabel);
                     il.MarkLabel(isDbNullLabel);
-                    il.Emit(OpCodes.Pop);
 
                     LoadDefaultValue(il, targetType);
 
                     il.MarkLabel(finishLabel);
+                    if (targetType.IsValueType == false)
+                    {
+                        // without this cast a VerificationException is thrown when JITing
+                        il.Emit(OpCodes.Castclass, targetType);
+                    }
                 }
                 else
                 {
@@ -3218,6 +3271,41 @@ namespace Dapper
 
             il.Emit(OpCodes.Box, valueTupleType);
             il.Emit(OpCodes.Ret);
+        }
+
+        static bool GetColumnAllowsDBNull(IDataReader reader, int ordinal)
+        {
+#if NET461
+            var schema = reader.GetSchemaTable();
+            if(schema != null)
+            {
+                var col = schema.Columns["AllowDBNull"];
+                if (col != null)
+                {
+                    object allowDBNull = schema.Rows[ordinal][col];
+                    if (allowDBNull is bool b && b == false)
+                    {
+                        return false;
+                    }
+                }
+            }
+            return true;
+#else
+            // At least for SqlClient, the schema objects get cached internally, so calling
+            // GetColumnSchema repeatedly on the same instance shouldn't be expensive.
+            var schema = (reader as IDbColumnSchemaGenerator)?.GetColumnSchema();
+            if (schema == null)
+            {
+                // most popular providers implement IDbColumSchemaGenerator now,
+                // so this would only be for esoteric providers that don't.
+                return true;
+            } 
+            else
+            {
+                var col = schema[ordinal];
+                return col.AllowDBNull != false;
+            }
+#endif
         }
 
         private static void GenerateDeserializerFromMap(Type type, IDataReader reader, int startBound, int length, bool returnNullIfFirstMissing, ILGenerator il)
@@ -3333,8 +3421,8 @@ namespace Dapper
                     // Save off the current index for access if an exception is thrown
                     EmitInt32(il, index);
                     il.Emit(OpCodes.Stloc, currentIndexDiagnosticLocal);
-
-                    LoadReaderValueOrBranchToDBNullLabel(il, index, ref stringEnumLocal, valueCopyDiagnosticLocal, reader.GetFieldType(index), memberType, out var isDbNullLabel);
+                    var canBeNull = GetColumnAllowsDBNull(reader, index);
+                    LoadReaderValueOrBranchToDBNullLabel(il, index, ref stringEnumLocal, valueCopyDiagnosticLocal, reader.GetFieldType(index), memberType, out var isDbNullLabel, canBeNull);
 
                     if (specializedConstructor == null)
                     {
@@ -3351,15 +3439,14 @@ namespace Dapper
 
                     il.Emit(OpCodes.Br_S, finishLabel); // stack is now [target]
 
-                    il.MarkLabel(isDbNullLabel); // incoming stack: [target][target][value]
+                    il.MarkLabel(isDbNullLabel); 
+                    // incoming stack: [target][target]
                     if (specializedConstructor != null)
                     {
-                        il.Emit(OpCodes.Pop);
-                        LoadDefaultValue(il, item.MemberType);
+                        LoadDefaultValue(il, item.MemberType); //[target]
                     }
                     else if (applyNullSetting && (!memberType.IsValueType || Nullable.GetUnderlyingType(memberType) != null))
                     {
-                        il.Emit(OpCodes.Pop); // stack is now [target][target]
                         // can load a null with this value
                         if (memberType.IsValueType)
                         { // must be Nullable<T> for some T
@@ -3383,7 +3470,6 @@ namespace Dapper
                     }
                     else
                     {
-                        il.Emit(OpCodes.Pop); // stack is now [target][target]
                         il.Emit(OpCodes.Pop); // stack is now [target]
                     }
 
@@ -3448,17 +3534,44 @@ namespace Dapper
             }
         }
 
-        private static void LoadReaderValueOrBranchToDBNullLabel(ILGenerator il, int index, ref LocalBuilder stringEnumLocal, LocalBuilder valueCopyLocal, Type colType, Type memberType, out Label isDbNullLabel)
+        private static void LoadReaderValueOrBranchToDBNullLabel(ILGenerator il, int index, ref LocalBuilder stringEnumLocal, LocalBuilder valueCopyLocal, Type colType, Type memberType, out Label isDbNullLabel, bool canBeNull)
         {
             isDbNullLabel = il.DefineLabel();
+
+            // only check for IsDBNull if the schema indicates it is possible.
+            if (canBeNull)
+            {
+                il.Emit(OpCodes.Ldarg_0); // stack is now [...][reader]
+                EmitInt32(il, index); // stack is now [...][reader][index]
+                il.Emit(OpCodes.Callvirt, isDBNullMethod); // stack is now [...][bool]
+                il.Emit(OpCodes.Brtrue_S, isDbNullLabel); // stack is now [...]
+            }
             il.Emit(OpCodes.Ldarg_0); // stack is now [...][reader]
             EmitInt32(il, index); // stack is now [...][reader][index]
-            il.Emit(OpCodes.Callvirt, getItem); // stack is now [...][value-as-object]
-
+            bool isValueType;
+            var accessor = GetAccessorMethod(colType, out isValueType);
+            il.Emit(OpCodes.Callvirt, accessor); // stack is now [...][value]
+            
             if (valueCopyLocal != null)
             {
-                il.Emit(OpCodes.Dup); // stack is now [...][value-as-object][value-as-object]
-                il.Emit(OpCodes.Stloc, valueCopyLocal); // stack is now [...][value-as-object]
+                if (isValueType)
+                {
+                    // TODO: decide if this compromise is acceptable. The only unit test affected was processing a Guid value.
+
+                    // if it is a value type, we want to avoid boxing it
+                    // unfortunately, conveying the value to the exception block
+                    // without boxing it is extremely complex (and probably slow).
+                    // Compromise by passing  the type of the column instead of the value.
+                    // Most commonly these exceptions would happen when processing strings,
+                    // in which case the value would still be passed, since it is a ref-type (else block below).
+                    il.Emit(OpCodes.Ldtoken, colType);
+                    il.Emit(OpCodes.Stloc, valueCopyLocal); // stack is now [...][value]
+                }
+                else
+                {
+                    il.Emit(OpCodes.Dup); // stack is now [...][value][value]
+                    il.Emit(OpCodes.Stloc, valueCopyLocal); // stack is now [...][value]
+                }
             }
 
             if (memberType == typeof(char) || memberType == typeof(char?))
@@ -3468,10 +3581,6 @@ namespace Dapper
             }
             else
             {
-                il.Emit(OpCodes.Dup); // stack is now [...][value-as-object][value-as-object]
-                il.Emit(OpCodes.Isinst, typeof(DBNull)); // stack is now [...][value-as-object][DBNull or null]
-                il.Emit(OpCodes.Brtrue_S, isDbNullLabel); // stack is now [...][value-as-object]
-
                 // unbox nullable enums as the primitive, i.e. byte etc
 
                 var nullUnderlyingType = Nullable.GetUnderlyingType(memberType);
@@ -3512,19 +3621,34 @@ namespace Dapper
                 }
                 else
                 {
-                    TypeCode dataTypeCode = Type.GetTypeCode(colType), unboxTypeCode = Type.GetTypeCode(unboxType);
+                    TypeCode dataTypeCode = Type.GetTypeCode(colType);
+                    TypeCode unboxTypeCode = Type.GetTypeCode(unboxType);
                     bool hasTypeHandler;
                     if ((hasTypeHandler = typeHandlers.ContainsKey(unboxType)) || colType == unboxType || dataTypeCode == unboxTypeCode || dataTypeCode == Type.GetTypeCode(nullUnderlyingType))
                     {
                         if (hasTypeHandler)
                         {
+                            if (isValueType)
+                            {
+                                il.Emit(OpCodes.Box, colType);
+                            }
 #pragma warning disable 618
                             il.EmitCall(OpCodes.Call, typeof(TypeHandlerCache<>).MakeGenericType(unboxType).GetMethod(nameof(TypeHandlerCache<int>.Parse)), null); // stack is now [...][typed-value]
 #pragma warning restore 618
-                        }
+                        } 
                         else
                         {
-                            il.Emit(OpCodes.Unbox_Any, unboxType); // stack is now [...][typed-value]
+                            if (nullUnderlyingType != null)
+                            {
+                                il.Emit(OpCodes.Newobj, unboxType.GetConstructor(new[] { nullUnderlyingType })); // stack is now [...][typed-value]
+                            } 
+                            else
+                            {
+                                if(unboxType == typeof(object) && isValueType)
+                                {
+                                    il.Emit(OpCodes.Box, colType);
+                                }
+                            }
                         }
                     }
                     else
@@ -3545,12 +3669,12 @@ namespace Dapper
             MethodInfo op;
             if (from == (via ?? to))
             {
-                il.Emit(OpCodes.Unbox_Any, to); // stack is now [target][target][typed-value]
+                // nothing to do, the value is already on the stack.
+                // stack is now [target][target][typed-value]
             }
             else if ((op = GetOperator(from, to)) != null)
             {
                 // this is handy for things like decimal <===> double
-                il.Emit(OpCodes.Unbox_Any, from); // stack is now [target][target][data-typed-value]
                 il.Emit(OpCodes.Call, op); // stack is now [target][target][typed-value]
             }
             else
@@ -3601,9 +3725,8 @@ namespace Dapper
                         break;
                 }
                 if (handled)
-                {
-                    il.Emit(OpCodes.Unbox_Any, from); // stack is now [target][target][col-typed-value]
-                    il.Emit(opCode); // stack is now [target][target][typed-value]
+                {                    
+                    il.Emit(opCode); // stack is now [target][target][value]
                     if (to == typeof(bool))
                     { // compare to zero; I checked "csc" - this is the trick it uses; nice
                         il.Emit(OpCodes.Ldc_I4_0);
@@ -3614,6 +3737,7 @@ namespace Dapper
                 }
                 else
                 {
+                    il.Emit(OpCodes.Box, from);
                     il.Emit(OpCodes.Ldtoken, via ?? to); // stack is now [target][target][value][member-type-token]
                     il.EmitCall(OpCodes.Call, typeof(Type).GetMethod(nameof(Type.GetTypeFromHandle)), null); // stack is now [target][target][value][member-type]
                     il.EmitCall(OpCodes.Call, InvariantCulture, null); // stack is now [target][target][value][member-type][culture]
@@ -3669,13 +3793,22 @@ namespace Dapper
                     }
                     try
                     {
-                        if (value == null || value is DBNull)
+                        // for value-type columns the value isn't available here,
+                        // but the type is. This is to avoid boxing the value.
+                        if (value is Type type)
                         {
-                            formattedValue = "<null>";
+                            formattedValue = "[" + type.Name + " value]";
                         }
                         else
                         {
-                            formattedValue = Convert.ToString(value) + " - " + Type.GetTypeCode(value.GetType());
+                            if (value == null || value is DBNull)
+                            {
+                                formattedValue = "<null>";
+                            }
+                            else
+                            {
+                                formattedValue = Convert.ToString(value) + " - " + Type.GetTypeCode(value.GetType());
+                            }
                         }
                     }
                     catch (Exception valEx)
